@@ -1,0 +1,15 @@
+{
+  "volumeMountPath": "/workspace",
+  "remoteDatasetPath": "/workspace/dataset",
+  "trainOutputDir": "/workspace/output",
+  "remoteModelsPath": "/workspace/models",
+  "runpodApiKey": "",
+  "instanceImage": "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
+  "modelPath": "http://psidox-ai.s3-website.ca-central-1.amazonaws.com/foxaiXVirilestallion_v2.safetensors",
+  "localDatasetPath": "./dataset",
+  "localOutputDir": "./output",
+  "minMemoryRequired": 20,
+  "minBidPriceLimit": 0,
+  "maxBidPriceLimit": 0.25,
+  "debug": true
+}

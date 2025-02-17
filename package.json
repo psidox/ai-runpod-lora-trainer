@@ -1,0 +1,30 @@
+{
+  "name": "runpod",
+  "version": "1.0.0",
+  "description": "",
+  "main": "runpod.js",
+  "scripts": {
+    "start": "babel-node pod.js --"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@apollo/client": "^3.12.9",
+    "@babel/cli": "^7.26.4",
+    "@babel/core": "^7.26.7",
+    "@babel/node": "^7.26.0",
+    "@babel/plugin-transform-modules-commonjs": "^7.26.3",
+    "@babel/preset-env": "^7.26.7",
+    "axios": "^1.7.9",
+    "commander": "^13.1.0",
+    "cross-fetch": "^4.1.0",
+    "fs-extra": "^11.3.0",
+    "graphql": "^16.10.0",
+    "graphql-request": "^7.1.2",
+    "node-scp": "^0.0.23",
+    "react": "^19.0.0",
+    "readline-sync": "^1.4.10",
+    "scp2": "^0.5.0",
+    "ssh2": "^1.16.0"
+  }
+}
