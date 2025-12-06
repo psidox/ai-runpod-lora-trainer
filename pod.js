@@ -6,6 +6,7 @@ import { execSync } from "child_process";
 import fs from "fs-extra";
 import os from "os";
 import path from "path";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------
 // Command-Line Arguments Setup Using Commander
@@ -27,9 +28,18 @@ program
   .option("--sdScriptsRepo <string>", "Repository for sd-scripts")
   .option("--sdScriptsDirName <string>", "Directory name for sd-scripts in the image")
   .option("--sdScriptsConfigFile <string>", "Config file to use with sd-scripts training")
+  .option("--ostrisBaseImage <string>", "Tag for the Ostris base image")
+  .option("--sdScriptsBaseImage <string>", "Tag for the sd-scripts base image")
   .option("--builtImageName <string>", "Tag for the prebuilt image that contains data and dependencies")
   .option("--baseImage <string>", "Base CUDA/PyTorch image used when building the custom image")
   .option("--pushBuiltImage", "Push the built image to the configured registry after build")
+  .option("--awsAccessKeyId <string>", "AWS access key for S3 uploads")
+  .option("--awsSecretAccessKey <string>", "AWS secret key for S3 uploads")
+  .option("--s3Region <string>", "AWS region for S3")
+  .option("--s3Bucket <string>", "S3 bucket to upload training artifacts")
+  .option("--s3OutputPrefix <string>", "Prefix within the bucket for trained model uploads")
+  .option("--s3ImageBucket <string>", "S3 bucket to store the prebuilt image tarball")
+  .option("--s3ImageKey <string>", "S3 object key for the prebuilt image tarball")
   .option("--keepContainerAlive", "Keep container running after training completes for debugging")
   .option("--debug", "Enable debug mode to log API, SSH, and SCP commands")
   .parse(process.argv);
@@ -58,9 +68,18 @@ const defaultConfig = {
   sdScriptsRepo: "https://github.com/kohya-ss/sd-scripts.git",
   sdScriptsDirName: "sd-scripts",
   sdScriptsConfigFile: "sd-config.json",
+  ostrisBaseImage: "ai-lora-ostris-base:latest",
+  sdScriptsBaseImage: "ai-lora-sd-base:latest",
   builtImageName: "ai-lora-trainer:latest",
   baseImage: "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
   pushBuiltImage: false,
+  awsAccessKeyId: "",
+  awsSecretAccessKey: "",
+  s3Region: "us-east-1",
+  s3Bucket: "",
+  s3OutputPrefix: "lora-outputs",
+  s3ImageBucket: "",
+  s3ImageKey: "lora-training-image.tar",
   keepContainerAlive: false,
   minMemoryRequired: 15,      // in GB
   minBidPriceLimit: 0.1,       // Example: $0.10
@@ -111,8 +130,12 @@ if (!action || (action !== "run" && action !== "build-image")) {
 }
 
 if (action === "build-image") {
-  buildTrainingImage(config);
-  process.exit(0);
+  buildTrainingImage(config)
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error("❌ Failed to build training image:", error);
+      process.exit(1);
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -227,11 +250,11 @@ async function chooseGpuType(minMemory, minBidPriceLimit, maxBidPriceLimit, grap
 }
 
 function generateEntrypointScript(config) {
-  const datasetConfigName = path.basename(config.trainingConfigFile);
-  const sdConfigName = config.sdScriptsConfigFile
-    ? path.basename(config.sdScriptsConfigFile)
-    : datasetConfigName;
-  return `#!/bin/bash\nset -euo pipefail\n\nDATA_CONFIG="${config.remoteDatasetPath}/training-config/${datasetConfigName}"\nSD_CONFIG="${config.remoteDatasetPath}/training-config/${sdConfigName}"\nOUTPUT_DIR="${config.trainOutputDir}"\nMODEL_PATH="${config.remoteModelsPath}/${getModelFilename(config.modelPath)}"\nTRAINING_BACKEND="${config.trainingBackend}"\nTOOLKIT_PRESET="${config.toolkitPreset}"\nNETWORK_TYPE="z-image-turbo"\nKEEP_ALIVE="${config.keepContainerAlive ? 1 : 0}"\n\nif [ ! -d "$OUTPUT_DIR" ]; then\n  mkdir -p "$OUTPUT_DIR"\nfi\n\ncase "$TRAINING_BACKEND" in\n  sd-scripts)\n    echo "Running sd-scripts training using $SD_CONFIG"\n    accelerate launch /workspace/${config.sdScriptsDirName}/train_network.py --config "$SD_CONFIG"\n    ;;\n  ostris|*)\n    echo "Running Ostris AI Toolkit training using $DATA_CONFIG"\n    cd /workspace/${config.toolkitDirName}\n    python -m aitoolkit.train_lora \\\n      --preset "$TOOLKIT_PRESET" \\\n      --dataset_config "$DATA_CONFIG" \\\n      --model "$MODEL_PATH" \\\n      --output_dir "$OUTPUT_DIR" \\\n      --network_type "$NETWORK_TYPE"\n    ;;\nesac\n\nif [ "$KEEP_ALIVE" = "1" ]; then\n  echo "Training complete. Keeping container alive for inspection."\n  tail -f /dev/null\nfi\n`;
+  const entrypointPath = path.join(process.cwd(), "docker", "entrypoint.sh");
+  if (!fs.existsSync(entrypointPath)) {
+    throw new Error("docker/entrypoint.sh is missing. Please ensure the docker folder is present.");
+  }
+  return fs.readFileSync(entrypointPath, "utf8");
 }
 
 function generateDockerfile(config) {
@@ -239,7 +262,85 @@ function generateDockerfile(config) {
   const sdConfigName = config.sdScriptsConfigFile
     ? path.basename(config.sdScriptsConfigFile)
     : datasetConfigName;
-  return `FROM ${config.baseImage}\n\nWORKDIR /workspace\nRUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*\n\n# Clone and install Ostris AI Toolkit\nRUN rm -rf /workspace/${config.toolkitDirName} && \\\n    git clone ${config.toolkitRepo} /workspace/${config.toolkitDirName} && \\\n    pip install --upgrade pip && \\\n    pip install -r /workspace/${config.toolkitDirName}/requirements.txt && \\\n    pip install -e /workspace/${config.toolkitDirName}\n\n# Clone sd-scripts for alternate backend\nRUN rm -rf /workspace/${config.sdScriptsDirName} && \\\n    git clone ${config.sdScriptsRepo} /workspace/${config.sdScriptsDirName} && \\\n    pip install -r /workspace/${config.sdScriptsDirName}/requirements.txt || true\nRUN pip install accelerate\n\n# Copy dataset and configs\nCOPY dataset ${config.remoteDatasetPath}\nCOPY training-config ${config.remoteDatasetPath}/training-config\n\n# Download base model into the image\nRUN mkdir -p ${config.remoteModelsPath} && \\\n    wget -O ${config.remoteModelsPath}/${getModelFilename(config.modelPath)} ${config.modelPath}\n\nCOPY entrypoint.sh /workspace/entrypoint.sh\nRUN chmod +x /workspace/entrypoint.sh\nENV TRAINING_BACKEND=${config.trainingBackend}\nENV TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}\nENV SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}\nENV OUTPUT_DIR=${config.trainOutputDir}\nENV MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}\nCMD ["/workspace/entrypoint.sh"]\n`;
+  const baseModelName = getModelFilename(config.modelPath);
+  return `FROM ${config.ostrisBaseImage || config.baseImage}
+
+WORKDIR /workspace
+RUN apt-get update && apt-get install -y git awscli wget && rm -rf /var/lib/apt/lists/*
+
+# sd-scripts backend in addition to Ostris base
+RUN rm -rf /workspace/${config.sdScriptsDirName} && \
+    git clone ${config.sdScriptsRepo} /workspace/${config.sdScriptsDirName} && \
+    pip install -r /workspace/${config.sdScriptsDirName}/requirements.txt && \
+    pip install accelerate
+
+# Copy dataset and configs
+COPY dataset ${config.remoteDatasetPath}
+COPY training-config ${config.remoteDatasetPath}/training-config
+
+# Download base model into the image
+RUN mkdir -p ${config.remoteModelsPath} && \
+    wget -O ${config.remoteModelsPath}/${baseModelName} ${config.modelPath}
+
+COPY entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
+ENV TRAINING_BACKEND=${config.trainingBackend}
+ENV TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}
+ENV SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}
+ENV OUTPUT_DIR=${config.trainOutputDir}
+ENV MODEL_PATH=${config.remoteModelsPath}/${baseModelName}
+ENV TOOLKIT_PRESET=${config.toolkitPreset}
+ENV NETWORK_TYPE=z-image-turbo
+ENV KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}
+ENV S3_BUCKET=${config.s3Bucket}
+ENV S3_OUTPUT_PREFIX=${config.s3OutputPrefix}
+ENV AWS_DEFAULT_REGION=${config.s3Region}
+CMD ["/workspace/entrypoint.sh"]
+`;
+}
+
+function createS3Client(config) {
+  return new S3Client({
+    region: config.s3Region,
+    credentials:
+      config.awsAccessKeyId && config.awsSecretAccessKey
+        ? {
+            accessKeyId: config.awsAccessKeyId,
+            secretAccessKey: config.awsSecretAccessKey,
+          }
+        : undefined,
+  });
+}
+
+async function uploadFileToS3(filePath, bucket, key, config) {
+  if (!bucket || !key) {
+    console.log("ℹ️  Skipping S3 upload because bucket or key was not provided.");
+    return;
+  }
+  const client = createS3Client(config);
+  const body = fs.createReadStream(filePath);
+  const fileSize = fs.statSync(filePath).size;
+  console.log(`☁️  Uploading ${filePath} to s3://${bucket}/${key}...`);
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentLength: fileSize,
+    })
+  );
+  console.log("✅ Image tarball uploaded to S3.");
+}
+
+function buildBaseImages(config) {
+  console.log("🧱 Building Ostris base image...");
+  runLocalCommand(
+    `docker build -f docker/Dockerfile.ostris-base --build-arg BASE_IMAGE=${config.baseImage} -t ${config.ostrisBaseImage} .`
+  );
+  console.log("🧱 Building sd-scripts base image...");
+  runLocalCommand(
+    `docker build -f docker/Dockerfile.sd-scripts-base --build-arg BASE_IMAGE=${config.baseImage} -t ${config.sdScriptsBaseImage} .`
+  );
 }
 
 function prepareBuildContext(config) {
@@ -267,15 +368,22 @@ function prepareBuildContext(config) {
   return tempDir;
 }
 
-function buildTrainingImage(config) {
+async function buildTrainingImage(config) {
   console.log("📦 Building Docker image with datasets and dependencies included...");
+  buildBaseImages(config);
   const contextDir = prepareBuildContext(config);
   runLocalCommand(`docker build -t ${config.builtImageName} ${contextDir}`);
   if (config.pushBuiltImage) {
     console.log(`🚀 Pushing image ${config.builtImageName} to registry...`);
     runLocalCommand(`docker push ${config.builtImageName}`);
   }
-  console.log(`✅ Image ready: ${config.builtImageName}`);
+
+  const tarPath = path.join(os.tmpdir(), `lora-image-${Date.now()}.tar`);
+  runLocalCommand(`docker save -o ${tarPath} ${config.builtImageName}`);
+  const bucket = config.s3ImageBucket || config.s3Bucket;
+  await uploadFileToS3(tarPath, bucket, config.s3ImageKey, config);
+  fs.removeSync(tarPath);
+  console.log(`✅ Image ready and archived: ${config.builtImageName}`);
 }
 
 /**
@@ -562,22 +670,65 @@ async function launchTraining(
   ssh,
   config
 ) {
-  console.log("🚀 Launching training inside the prebuilt container image...");
-  const datasetConfigName = path.basename(config.trainingConfigFile);
+  console.log("🚀 Launching training from the S3-archived container image...");
+  const bucket = config.s3ImageBucket || config.s3Bucket;
+  if (!bucket || !config.s3ImageKey) {
+    throw new Error("S3 image bucket and key are required to retrieve the training image inside the pod.");
+  }
+
+  const installer = [
+    "apt-get update",
+    "apt-get install -y awscli docker.io",
+    "service docker start || true"
+  ].join(" && ");
+  await executeCommand(ssh, installer, config);
+
+  const awsEnvExports = [
+    config.awsAccessKeyId ? `export AWS_ACCESS_KEY_ID='${config.awsAccessKeyId}'` : null,
+    config.awsSecretAccessKey ? `export AWS_SECRET_ACCESS_KEY='${config.awsSecretAccessKey}'` : null,
+    `export AWS_DEFAULT_REGION='${config.s3Region}'`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
+
+  const downloadCommand = [awsEnvExports, `aws s3 cp s3://${bucket}/${config.s3ImageKey} /workspace/training-image.tar --region ${config.s3Region}`]
+    .filter(Boolean)
+    .join(" && ");
+  await executeCommand(ssh, downloadCommand, config);
+
   const sdConfigName = config.sdScriptsConfigFile
     ? path.basename(config.sdScriptsConfigFile)
-    : datasetConfigName;
-  const env = [
-    `TRAINING_BACKEND=${config.trainingBackend}`,
-    `OUTPUT_DIR=${config.trainOutputDir}`,
-    `MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`,
-    `TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}`,
-    `SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}`,
-    `TOOLKIT_PRESET=${config.toolkitPreset}`,
-    `KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}`,
-  ].join(" ");
-  const trainingCommand = `${env} /workspace/entrypoint.sh`;
-  await executeCommand(ssh, trainingCommand, config);
+    : path.basename(config.trainingConfigFile);
+  const runtimeEnv = [
+    `-e TRAINING_BACKEND=${config.trainingBackend}`,
+    `-e TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${path.basename(config.trainingConfigFile)}`,
+    `-e SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}`,
+    `-e OUTPUT_DIR=${config.trainOutputDir}`,
+    `-e MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`,
+    `-e TOOLKIT_PRESET=${config.toolkitPreset}`,
+    `-e NETWORK_TYPE=z-image-turbo`,
+    `-e KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}`,
+    config.s3Bucket ? `-e S3_BUCKET=${config.s3Bucket}` : null,
+    `-e S3_OUTPUT_PREFIX=${config.s3OutputPrefix}`,
+    `-e AWS_DEFAULT_REGION=${config.s3Region}`,
+    config.awsAccessKeyId ? `-e AWS_ACCESS_KEY_ID=${config.awsAccessKeyId}` : null,
+    config.awsSecretAccessKey ? `-e AWS_SECRET_ACCESS_KEY=${config.awsSecretAccessKey}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const volumeFlags = [`-v ${config.trainOutputDir}:${config.trainOutputDir}`];
+
+  const dockerCommands = [
+    awsEnvExports,
+    `mkdir -p ${config.trainOutputDir}`,
+    "docker load -i /workspace/training-image.tar",
+    `docker run --rm --gpus all --ipc=host --network=host ${volumeFlags.join(" ")} ${runtimeEnv} ${config.builtImageName}`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
+
+  await executeCommand(ssh, dockerCommands, config);
 }
 
 /**
@@ -624,9 +775,6 @@ async function downloadOutput(instance, username, trainOutputDir, localOutputDir
 // MAIN SCRIPT FLOW
 // ---------------------------------------------------------------------
 async function main(config) {
-  // Ensure the runtime image points to the prebuilt artifact when provided.
-  config.instanceImage = config.builtImageName || config.instanceImage;
-
   // Create a GraphQL client using the provided API key.
   const graphqlClient = new ApolloClient({
     link: new HttpLink({
@@ -660,7 +808,7 @@ async function main(config) {
   // 3. Establish an SSH connection (using username "root").
   const sshConnection = await connectSSH(instance, "root");
 
-  console.log("📦 Using prebuilt image; skipping dataset/model uploads and dependency installs.");
+  console.log("📦 Using S3-archived prebuilt image; skipping dataset/model uploads and dependency installs.");
 
   // Launch the training directly from the image contents.
   await launchTraining(sshConnection, config);
@@ -677,4 +825,6 @@ async function main(config) {
   process.exit(0);
 }
 
-main(config);
+if (action !== "build-image") {
+  main(config);
+}

@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+RUN apt-get update && apt-get install -y git awscli && rm -rf /var/lib/apt/lists/*
+
+# sd-scripts base
+RUN rm -rf /workspace/sd-scripts && \
+    git clone https://github.com/kohya-ss/sd-scripts.git /workspace/sd-scripts && \
+    pip install --upgrade pip && \
+    pip install -r /workspace/sd-scripts/requirements.txt && \
+    pip install accelerate

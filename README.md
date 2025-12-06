@@ -25,7 +25,7 @@
 3. **SSH + SCP**: Automatically transfers training outputs after the run.
 4. **LoRA Training**: Automates installing dependencies and launching either the Ostris AI Toolkit (`z-image-turbo` preset) or sd-scripts from the same container image.
 5. **Debug Mode**: Logs GraphQL requests/responses, SSH commands, and other details.
-6. **Preloaded Images**: Build a Docker image with your dataset, configs, and base model baked in, then run pods directly from that image.
+6. **Preloaded Images via S3**: Build a Docker image with your dataset, configs, and base model baked in, automatically upload the tarball to S3, and have pods download/load it before running training.
 
 ---
 
@@ -33,9 +33,11 @@
 
 1. **Clone** or **download** this repository (or place the script in your project).
 2. **Install dependencies**:
-   ```bash
-   npm install
-   ```
+ ```bash
+ npm install
+ ```
+
+The `docker/` folder includes two base Dockerfiles (`Dockerfile.ostris-base` and `Dockerfile.sd-scripts-base`) plus a shared `entrypoint.sh` that the training image uses to launch either backend and sync finished artifacts to S3.
 
 ---
 
@@ -43,13 +45,13 @@
 
 Run:
 
-1. Build the preloaded image (optional but recommended):
+1. Build the preloaded image (uploads the tarball to S3 for pods to fetch):
 
 ```bash
 node pod.js build-image --config config.json
 ```
 
-2. Run training on RunPod using that image:
+2. Run training on RunPod (the pod will download the S3-hosted image tarball and load it locally):
 
 ```bash
 node pod.js run --config config.json
@@ -92,6 +94,13 @@ The script merges:
   "localDatasetPath": "./dataset",
   "localOutputDir": "./output",
   "trainingBackend": "ostris",
+  "awsAccessKeyId": "YOUR_AWS_ACCESS_KEY",
+  "awsSecretAccessKey": "YOUR_AWS_SECRET",
+  "s3Region": "us-east-1",
+  "s3Bucket": "your-training-artifact-bucket",
+  "s3OutputPrefix": "lora-outputs",
+  "s3ImageBucket": "your-training-artifact-bucket",
+  "s3ImageKey": "lora-training-image.tar",
   "builtImageName": "your-registry/ai-lora-trainer:latest",
   "baseImage": "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
   "minMemoryRequired": 15,
@@ -110,8 +119,8 @@ The script merges:
 3. **Deploy Pod**: Starts an on-demand GPU instance.
 4. **Wait for Ready**: Polls RunPod until the instance is ready.
 5. **SSH**: Connects to the instance as `root` via SSH.
-6. **Train LoRA**: Runs `/workspace/entrypoint.sh` from the prebuilt image to trigger either Ostris AI Toolkit or sd-scripts training.
-7. **Download Output**: Retrieves artifacts and logs.
+6. **Pull Image from S3**: Downloads the saved Docker image tarball from S3, loads it locally, and runs it with GPU access so the bundled entrypoint kicks off training (either backend) and syncs outputs to S3.
+7. **Download Output (optional)**: Retrieves artifacts and logs over SCP if you still want a local copy.
 8. **Stop Pod**: Shuts down the GPU instance to avoid further billing.
 
 ---
@@ -147,3 +156,5 @@ node pod.js run --config config.json
 - **Prices & Limits**: The script picks the first GPU that matches your memory/price constraints. Ensure your price range is realistic.
 - **SSH Key**: You must have a valid SSH key on your local machine.
 - **Interruptible Pods**: If you want to use a spot (interruptible) instance, you may need to modify the relevant GraphQL mutation.
+- **AWS Credentials**: Building uploads the image tarball to S3 and the pod downloads/uploads artifacts using AWS credentials provided in the config or environment.
+- **Docker-in-Pod**: The run stage installs Docker inside the pod to load the S3 image tarball. Ensure your selected RunPod base image allows installing and running Docker.
