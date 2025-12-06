@@ -2,7 +2,10 @@ import { program } from "commander";
 import { ApolloClient, InMemoryCache, HttpLink, gql } from "@apollo/client";
 import { Client } from "ssh2";
 import { Client as ScpClient } from "node-scp";
+import { execSync } from "child_process";
 import fs from "fs-extra";
+import os from "os";
+import path from "path";
 
 // ---------------------------------------------------------------------
 // Command-Line Arguments Setup Using Commander
@@ -20,6 +23,14 @@ program
   .option("--modelPath <string>", "Hugging Face model path")
   .option("--localDatasetPath <string>", "Local dataset directory")
   .option("--localOutputDir <string>", "Local output directory")
+  .option("--trainingBackend <string>", "Training backend to invoke: ostris or sd-scripts")
+  .option("--sdScriptsRepo <string>", "Repository for sd-scripts")
+  .option("--sdScriptsDirName <string>", "Directory name for sd-scripts in the image")
+  .option("--sdScriptsConfigFile <string>", "Config file to use with sd-scripts training")
+  .option("--builtImageName <string>", "Tag for the prebuilt image that contains data and dependencies")
+  .option("--baseImage <string>", "Base CUDA/PyTorch image used when building the custom image")
+  .option("--pushBuiltImage", "Push the built image to the configured registry after build")
+  .option("--keepContainerAlive", "Keep container running after training completes for debugging")
   .option("--debug", "Enable debug mode to log API, SSH, and SCP commands")
   .parse(process.argv);
 
@@ -43,6 +54,14 @@ const defaultConfig = {
   toolkitDirName: "ai-toolkit",
   toolkitPreset: "z-image-turbo",
   trainingConfigFile: "config.toml",
+  trainingBackend: "ostris",
+  sdScriptsRepo: "https://github.com/kohya-ss/sd-scripts.git",
+  sdScriptsDirName: "sd-scripts",
+  sdScriptsConfigFile: "sd-config.json",
+  builtImageName: "ai-lora-trainer:latest",
+  baseImage: "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
+  pushBuiltImage: false,
+  keepContainerAlive: false,
   minMemoryRequired: 15,      // in GB
   minBidPriceLimit: 0.1,       // Example: $0.10
   maxBidPriceLimit: 0.2,       // Example: $0.20
@@ -82,11 +101,17 @@ const config = { ...defaultConfig, ...(fileConfig || {}), ...options };
 // ---------------------------------------------------------------------
 // If "run" is not passed as the first argument, print config and exit.
 // ---------------------------------------------------------------------
-if (!action || action !== "run") {
+if (!action || (action !== "run" && action !== "build-image")) {
   console.log("Current configuration options:");
   console.log(JSON.stringify(config, null, 2));
-  console.log("\nTo run the script, pass 'run' as the first argument. For example:");
+  console.log("\nTo run the script, pass 'run' as the first argument or 'build-image' to produce a preloaded image. For example:");
+  console.log("  node runpod_lora_train.js build-image --config config.json");
   console.log("  node runpod_lora_train.js run --config config.json");
+  process.exit(0);
+}
+
+if (action === "build-image") {
+  buildTrainingImage(config);
   process.exit(0);
 }
 
@@ -127,6 +152,11 @@ function getModelFilename(modelPath) {
   const cleaned = modelPath.replace(/\/$/, "");
   const parts = cleaned.split("/").filter(Boolean);
   return parts.length ? parts[parts.length - 1] : "model.safetensors";
+}
+
+function runLocalCommand(command) {
+  console.log(`$ ${command}`);
+  execSync(command, { stdio: "inherit" });
 }
 
 /**
@@ -194,6 +224,58 @@ async function chooseGpuType(minMemory, minBidPriceLimit, maxBidPriceLimit, grap
     console.error("❌ Error querying GPU types:", error);
     process.exit(1);
   }
+}
+
+function generateEntrypointScript(config) {
+  const datasetConfigName = path.basename(config.trainingConfigFile);
+  const sdConfigName = config.sdScriptsConfigFile
+    ? path.basename(config.sdScriptsConfigFile)
+    : datasetConfigName;
+  return `#!/bin/bash\nset -euo pipefail\n\nDATA_CONFIG="${config.remoteDatasetPath}/training-config/${datasetConfigName}"\nSD_CONFIG="${config.remoteDatasetPath}/training-config/${sdConfigName}"\nOUTPUT_DIR="${config.trainOutputDir}"\nMODEL_PATH="${config.remoteModelsPath}/${getModelFilename(config.modelPath)}"\nTRAINING_BACKEND="${config.trainingBackend}"\nTOOLKIT_PRESET="${config.toolkitPreset}"\nNETWORK_TYPE="z-image-turbo"\nKEEP_ALIVE="${config.keepContainerAlive ? 1 : 0}"\n\nif [ ! -d "$OUTPUT_DIR" ]; then\n  mkdir -p "$OUTPUT_DIR"\nfi\n\ncase "$TRAINING_BACKEND" in\n  sd-scripts)\n    echo "Running sd-scripts training using $SD_CONFIG"\n    accelerate launch /workspace/${config.sdScriptsDirName}/train_network.py --config "$SD_CONFIG"\n    ;;\n  ostris|*)\n    echo "Running Ostris AI Toolkit training using $DATA_CONFIG"\n    cd /workspace/${config.toolkitDirName}\n    python -m aitoolkit.train_lora \\\n      --preset "$TOOLKIT_PRESET" \\\n      --dataset_config "$DATA_CONFIG" \\\n      --model "$MODEL_PATH" \\\n      --output_dir "$OUTPUT_DIR" \\\n      --network_type "$NETWORK_TYPE"\n    ;;\nesac\n\nif [ "$KEEP_ALIVE" = "1" ]; then\n  echo "Training complete. Keeping container alive for inspection."\n  tail -f /dev/null\nfi\n`;
+}
+
+function generateDockerfile(config) {
+  const datasetConfigName = path.basename(config.trainingConfigFile);
+  const sdConfigName = config.sdScriptsConfigFile
+    ? path.basename(config.sdScriptsConfigFile)
+    : datasetConfigName;
+  return `FROM ${config.baseImage}\n\nWORKDIR /workspace\nRUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*\n\n# Clone and install Ostris AI Toolkit\nRUN rm -rf /workspace/${config.toolkitDirName} && \\\n    git clone ${config.toolkitRepo} /workspace/${config.toolkitDirName} && \\\n    pip install --upgrade pip && \\\n    pip install -r /workspace/${config.toolkitDirName}/requirements.txt && \\\n    pip install -e /workspace/${config.toolkitDirName}\n\n# Clone sd-scripts for alternate backend\nRUN rm -rf /workspace/${config.sdScriptsDirName} && \\\n    git clone ${config.sdScriptsRepo} /workspace/${config.sdScriptsDirName} && \\\n    pip install -r /workspace/${config.sdScriptsDirName}/requirements.txt || true\nRUN pip install accelerate\n\n# Copy dataset and configs\nCOPY dataset ${config.remoteDatasetPath}\nCOPY training-config ${config.remoteDatasetPath}/training-config\n\n# Download base model into the image\nRUN mkdir -p ${config.remoteModelsPath} && \\\n    wget -O ${config.remoteModelsPath}/${getModelFilename(config.modelPath)} ${config.modelPath}\n\nCOPY entrypoint.sh /workspace/entrypoint.sh\nRUN chmod +x /workspace/entrypoint.sh\nENV TRAINING_BACKEND=${config.trainingBackend}\nENV TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}\nENV SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}\nENV OUTPUT_DIR=${config.trainOutputDir}\nENV MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}\nCMD ["/workspace/entrypoint.sh"]\n`;
+}
+
+function prepareBuildContext(config) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "lora-build-"));
+  const datasetTarget = path.join(tempDir, "dataset");
+  const configTarget = path.join(tempDir, "training-config");
+  fs.ensureDirSync(datasetTarget);
+  fs.ensureDirSync(configTarget);
+
+  if (!fs.existsSync(config.localDatasetPath)) {
+    throw new Error(`Dataset path not found: ${config.localDatasetPath}`);
+  }
+  fs.copySync(config.localDatasetPath, datasetTarget);
+
+  if (!fs.existsSync(config.trainingConfigFile)) {
+    throw new Error(`Training config file not found: ${config.trainingConfigFile}`);
+  }
+  fs.copyFileSync(config.trainingConfigFile, path.join(configTarget, path.basename(config.trainingConfigFile)));
+  if (config.sdScriptsConfigFile && fs.existsSync(config.sdScriptsConfigFile)) {
+    fs.copyFileSync(config.sdScriptsConfigFile, path.join(configTarget, path.basename(config.sdScriptsConfigFile)));
+  }
+
+  fs.writeFileSync(path.join(tempDir, "entrypoint.sh"), generateEntrypointScript(config), { mode: 0o755 });
+  fs.writeFileSync(path.join(tempDir, "Dockerfile"), generateDockerfile(config));
+  return tempDir;
+}
+
+function buildTrainingImage(config) {
+  console.log("📦 Building Docker image with datasets and dependencies included...");
+  const contextDir = prepareBuildContext(config);
+  runLocalCommand(`docker build -t ${config.builtImageName} ${contextDir}`);
+  if (config.pushBuiltImage) {
+    console.log(`🚀 Pushing image ${config.builtImageName} to registry...`);
+    runLocalCommand(`docker push ${config.builtImageName}`);
+  }
+  console.log(`✅ Image ready: ${config.builtImageName}`);
 }
 
 /**
@@ -478,22 +560,23 @@ async function installPythonRequirements(ssh, config, toolkitPath) {
  */
 async function launchTraining(
   ssh,
-  toolkitPath,
-  datasetConfigPath,
-  trainOutputDir,
-  baseModelPath,
   config
 ) {
-  console.log("🚀 Launching LoRA training...");
-  const trainingCommand = `
-    cd ${toolkitPath} &&
-    python -m aitoolkit.train_lora \
-      --preset ${config.toolkitPreset} \
-      --dataset_config ${datasetConfigPath} \
-      --model ${baseModelPath} \
-      --output_dir ${trainOutputDir} \
-      --network_type z-image-turbo
-  `;
+  console.log("🚀 Launching training inside the prebuilt container image...");
+  const datasetConfigName = path.basename(config.trainingConfigFile);
+  const sdConfigName = config.sdScriptsConfigFile
+    ? path.basename(config.sdScriptsConfigFile)
+    : datasetConfigName;
+  const env = [
+    `TRAINING_BACKEND=${config.trainingBackend}`,
+    `OUTPUT_DIR=${config.trainOutputDir}`,
+    `MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`,
+    `TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}`,
+    `SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}`,
+    `TOOLKIT_PRESET=${config.toolkitPreset}`,
+    `KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}`,
+  ].join(" ");
+  const trainingCommand = `${env} /workspace/entrypoint.sh`;
   await executeCommand(ssh, trainingCommand, config);
 }
 
@@ -541,6 +624,9 @@ async function downloadOutput(instance, username, trainOutputDir, localOutputDir
 // MAIN SCRIPT FLOW
 // ---------------------------------------------------------------------
 async function main(config) {
+  // Ensure the runtime image points to the prebuilt artifact when provided.
+  config.instanceImage = config.builtImageName || config.instanceImage;
+
   // Create a GraphQL client using the provided API key.
   const graphqlClient = new ApolloClient({
     link: new HttpLink({
@@ -574,33 +660,12 @@ async function main(config) {
   // 3. Establish an SSH connection (using username "root").
   const sshConnection = await connectSSH(instance, "root");
 
-  // 4. Upload the dataset.
-  await uploadDataset(config.localDatasetPath, instance, "root", config.remoteDatasetPath, config);
+  console.log("📦 Using prebuilt image; skipping dataset/model uploads and dependency installs.");
 
-  const toolkitPath = `${config.volumeMountPath}/${config.toolkitDirName}`;
-  const datasetConfigPath = `${config.remoteDatasetPath}/${config.trainingConfigFile}`;
-  const baseModelPath = `${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`;
+  // Launch the training directly from the image contents.
+  await launchTraining(sshConnection, config);
 
-  // 5. Download the base model from Hugging Face.
-  await downloadModel(sshConnection, config, baseModelPath);
-
-  // 6. Clone the Ostris AI Toolkit repository.
-  await cloneAiToolkit(sshConnection, config, toolkitPath);
-
-  // 7. Install Python requirements.
-  await installPythonRequirements(sshConnection, config, toolkitPath);
-
-  // 8. Launch the LoRA training.
-  await launchTraining(
-    sshConnection,
-    toolkitPath,
-    datasetConfigPath,
-    config.trainOutputDir,
-    baseModelPath,
-    config
-  );
-
-  // 9. Download the training output.
+  // Download the training output.
   await downloadOutput(instance, "root", config.trainOutputDir, config.localOutputDir, config);
 
   // 10. Stop the pod.
