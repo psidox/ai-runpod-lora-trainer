@@ -39,6 +39,10 @@ const defaultConfig = {
   modelPath: "runwayml/stable-diffusion-v1-5",
   localDatasetPath: "./dataset",
   localOutputDir: "./output",
+  toolkitRepo: "https://github.com/ostris/ai-toolkit.git",
+  toolkitDirName: "ai-toolkit",
+  toolkitPreset: "z-image-turbo",
+  trainingConfigFile: "config.toml",
   minMemoryRequired: 15,      // in GB
   minBidPriceLimit: 0.1,       // Example: $0.10
   maxBidPriceLimit: 0.2,       // Example: $0.20
@@ -114,6 +118,16 @@ async function debugGraphQLRequest(client, query, variables, config) {
 // ---------------------------------------------------------------------
 // FUNCTION DEFINITIONS (All functions receive parameters)
 // ---------------------------------------------------------------------
+
+/**
+ * Extract a deterministic filename for the remote model download.
+ */
+function getModelFilename(modelPath) {
+  if (!modelPath) return "model.safetensors";
+  const cleaned = modelPath.replace(/\/$/, "");
+  const parts = cleaned.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "model.safetensors";
+}
 
 /**
  * chooseGpuType(minMemory, minBidPriceLimit, maxBidPriceLimit, graphqlClient, config)
@@ -432,45 +446,53 @@ async function executeCommand(ssh, command, config) {
 }
 
 /**
- * cloneSdScripts(ssh, config)
+ * cloneAiToolkit(ssh, config, toolkitPath)
  *
- * Clones the sd-scripts repository into the home directory.
+ * Clones the Ostris AI Toolkit repository into the workspace.
  */
-async function cloneSdScripts(ssh, config) {
-  console.log("📥 Cloning sd-scripts repository...");
-  const command = `git clone https://github.com/kohya-ss/sd-scripts.git ${config.volumeMountPath}/sd-scripts`;
+async function cloneAiToolkit(ssh, config, toolkitPath) {
+  console.log("📥 Cloning Ostris AI Toolkit repository...");
+  const command = `rm -rf ${toolkitPath} && git clone ${config.toolkitRepo} ${toolkitPath}`;
   await executeCommand(ssh, command, config);
 }
 
 /**
- * installPythonRequirements(ssh, config)
+ * installPythonRequirements(ssh, config, toolkitPath)
  *
- * Installs the Python requirements for the sd-scripts repository.
+ * Installs the Python requirements for the Ostris AI Toolkit repository.
  */
-async function installPythonRequirements(ssh, config) {
-  console.log("📦 Installing Python requirements...");
-  const command = `cd ${config.volumeMountPath}/sd-scripts &&
-    pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118 &&
-    pip install --upgrade -r requirements.txt && 
-    pip install xformers==0.0.23.post1 --index-url https://download.pytorch.org/whl/cu118
+async function installPythonRequirements(ssh, config, toolkitPath) {
+  console.log("📦 Installing Python requirements for Ostris AI Toolkit...");
+  const command = `cd ${toolkitPath} &&
+    pip install --upgrade pip &&
+    pip install --upgrade -r requirements.txt &&
+    pip install -e .
 `;
-
-// pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121 &&
-// pip install --upgrade -r requirements.txt && 
-// pip install xformers==0.0.22.post4 --index-url https://download.pytorch.org/whl/cu121
   await executeCommand(ssh, command, config);
 }
 
 /**
- * launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteModelsPath, config)
+ * launchTraining(ssh, toolkitPath, datasetConfigPath, trainOutputDir, baseModelPath, config)
  *
- * Launches the LoRA training process using the sd-scripts repository.
+ * Launches the LoRA training process using the Ostris AI Toolkit repository.
  */
-async function launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteModelsPath, config) {
+async function launchTraining(
+  ssh,
+  toolkitPath,
+  datasetConfigPath,
+  trainOutputDir,
+  baseModelPath,
+  config
+) {
   console.log("🚀 Launching LoRA training...");
   const trainingCommand = `
-    cd ${config.volumeMountPath}/sd-scripts && 
-    accelerate launch sdxl_train_network.py --config_file=../dataset/config.toml
+    cd ${toolkitPath} &&
+    python -m aitoolkit.train_lora \
+      --preset ${config.toolkitPreset} \
+      --dataset_config ${datasetConfigPath} \
+      --model ${baseModelPath} \
+      --output_dir ${trainOutputDir} \
+      --network_type z-image-turbo
   `;
   await executeCommand(ssh, trainingCommand, config);
 }
@@ -480,13 +502,12 @@ async function launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteMode
  *
  * Downloads the base model from Hugging Face into the remote models directory.
  */
-async function downloadModel(ssh, config) {
+async function downloadModel(ssh, config, targetModelPath) {
   console.log("📥 Downloading model from Hugging Face...");
   const command = `
     mkdir -p ${config.trainOutputDir} &&
     mkdir -p ${config.remoteModelsPath} &&
-    cd ${config.remoteModelsPath} &&
-    wget -q ${config.modelPath}
+    wget -q -O ${targetModelPath} ${config.modelPath}
   `;
   await executeCommand(ssh, command, config);
 }
@@ -556,17 +577,28 @@ async function main(config) {
   // 4. Upload the dataset.
   await uploadDataset(config.localDatasetPath, instance, "root", config.remoteDatasetPath, config);
 
-  // 5. Download the base model from Hugging Face.
-  await downloadModel(sshConnection, config);
+  const toolkitPath = `${config.volumeMountPath}/${config.toolkitDirName}`;
+  const datasetConfigPath = `${config.remoteDatasetPath}/${config.trainingConfigFile}`;
+  const baseModelPath = `${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`;
 
-  // 6. Clone the sd-scripts repository.
-  await cloneSdScripts(sshConnection, config);
+  // 5. Download the base model from Hugging Face.
+  await downloadModel(sshConnection, config, baseModelPath);
+
+  // 6. Clone the Ostris AI Toolkit repository.
+  await cloneAiToolkit(sshConnection, config, toolkitPath);
 
   // 7. Install Python requirements.
-  await installPythonRequirements(sshConnection, config);
+  await installPythonRequirements(sshConnection, config, toolkitPath);
 
   // 8. Launch the LoRA training.
-  await launchTraining(sshConnection, config.remoteDatasetPath, config.trainOutputDir, config.remoteModelsPath, config);
+  await launchTraining(
+    sshConnection,
+    toolkitPath,
+    datasetConfigPath,
+    config.trainOutputDir,
+    baseModelPath,
+    config
+  );
 
   // 9. Download the training output.
   await downloadOutput(instance, "root", config.trainOutputDir, config.localOutputDir, config);

@@ -1,6 +1,6 @@
 # RunPod LoRA Training CLI
 
-`runpod_lora_train.js` is a Node.js command-line tool that automates deploying a GPU pod on [RunPod](https://www.runpod.io/) to train a **LoRA** (Low-Rank Adaptation) model, using the [sd-scripts](https://github.com/kohya-ss/sd-scripts) repository.
+`runpod_lora_train.js` is a Node.js command-line tool that automates deploying a GPU pod on [RunPod](https://www.runpod.io/) to train a **LoRA** (Low-Rank Adaptation) model using the [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit) and its `z-image-turbo` preset.
 
 ## Table of Contents
 
@@ -23,7 +23,7 @@
    - Start/stop GPU pods.
    - Monitor pod status.
 3. **SSH + SCP**: Automatically transfers local dataset to the remote pod, then downloads training outputs.
-4. **LoRA Training**: Automates installing dependencies and launching `sd-scripts` to train a LoRA.
+4. **LoRA Training**: Automates installing dependencies and launching the Ostris AI Toolkit to train a `z-image-turbo` LoRA.
 5. **Debug Mode**: Logs GraphQL requests/responses, SSH commands, and other details.
 
 ---
@@ -95,8 +95,8 @@ The script merges:
 5. **SSH**: Connects to the instance as `root` via SSH.
 6. **Upload Dataset**: Uses SCP to send your local dataset to the instance.
 7. **Download Model**: Pulls or downloads the base model to the remote environment.
-8. **Clone & Install**: Clones `sd-scripts`, installs Python dependencies.
-9. **Train LoRA**: Executes the training script via `accelerate launch ...`.
+8. **Clone & Install**: Clones the Ostris AI Toolkit repository, installs Python dependencies.
+9. **Train LoRA**: Executes the toolkit's LoRA trainer with the `z-image-turbo` preset.
 10. **Download Output**: Retrieves artifacts and logs.
 11. **Stop Pod**: Shuts down the GPU instance to avoid further billing.
 
