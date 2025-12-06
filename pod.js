@@ -2,7 +2,11 @@ import { program } from "commander";
 import { ApolloClient, InMemoryCache, HttpLink, gql } from "@apollo/client";
 import { Client } from "ssh2";
 import { Client as ScpClient } from "node-scp";
+import { execSync } from "child_process";
 import fs from "fs-extra";
+import os from "os";
+import path from "path";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------
 // Command-Line Arguments Setup Using Commander
@@ -20,6 +24,23 @@ program
   .option("--modelPath <string>", "Hugging Face model path")
   .option("--localDatasetPath <string>", "Local dataset directory")
   .option("--localOutputDir <string>", "Local output directory")
+  .option("--trainingBackend <string>", "Training backend to invoke: ostris or sd-scripts")
+  .option("--sdScriptsRepo <string>", "Repository for sd-scripts")
+  .option("--sdScriptsDirName <string>", "Directory name for sd-scripts in the image")
+  .option("--sdScriptsConfigFile <string>", "Config file to use with sd-scripts training")
+  .option("--ostrisBaseImage <string>", "Tag for the Ostris base image")
+  .option("--sdScriptsBaseImage <string>", "Tag for the sd-scripts base image")
+  .option("--builtImageName <string>", "Tag for the prebuilt image that contains data and dependencies")
+  .option("--baseImage <string>", "Base CUDA/PyTorch image used when building the custom image")
+  .option("--pushBuiltImage", "Push the built image to the configured registry after build")
+  .option("--awsAccessKeyId <string>", "AWS access key for S3 uploads")
+  .option("--awsSecretAccessKey <string>", "AWS secret key for S3 uploads")
+  .option("--s3Region <string>", "AWS region for S3")
+  .option("--s3Bucket <string>", "S3 bucket to upload training artifacts")
+  .option("--s3OutputPrefix <string>", "Prefix within the bucket for trained model uploads")
+  .option("--s3ImageBucket <string>", "S3 bucket to store the prebuilt image tarball")
+  .option("--s3ImageKey <string>", "S3 object key for the prebuilt image tarball")
+  .option("--keepContainerAlive", "Keep container running after training completes for debugging")
   .option("--debug", "Enable debug mode to log API, SSH, and SCP commands")
   .parse(process.argv);
 
@@ -39,6 +60,27 @@ const defaultConfig = {
   modelPath: "runwayml/stable-diffusion-v1-5",
   localDatasetPath: "./dataset",
   localOutputDir: "./output",
+  toolkitRepo: "https://github.com/ostris/ai-toolkit.git",
+  toolkitDirName: "ai-toolkit",
+  toolkitPreset: "z-image-turbo",
+  trainingConfigFile: "config.toml",
+  trainingBackend: "ostris",
+  sdScriptsRepo: "https://github.com/kohya-ss/sd-scripts.git",
+  sdScriptsDirName: "sd-scripts",
+  sdScriptsConfigFile: "sd-config.json",
+  ostrisBaseImage: "ai-lora-ostris-base:latest",
+  sdScriptsBaseImage: "ai-lora-sd-base:latest",
+  builtImageName: "ai-lora-trainer:latest",
+  baseImage: "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
+  pushBuiltImage: false,
+  awsAccessKeyId: "",
+  awsSecretAccessKey: "",
+  s3Region: "us-east-1",
+  s3Bucket: "",
+  s3OutputPrefix: "lora-outputs",
+  s3ImageBucket: "",
+  s3ImageKey: "lora-training-image.tar",
+  keepContainerAlive: false,
   minMemoryRequired: 15,      // in GB
   minBidPriceLimit: 0.1,       // Example: $0.10
   maxBidPriceLimit: 0.2,       // Example: $0.20
@@ -78,12 +120,22 @@ const config = { ...defaultConfig, ...(fileConfig || {}), ...options };
 // ---------------------------------------------------------------------
 // If "run" is not passed as the first argument, print config and exit.
 // ---------------------------------------------------------------------
-if (!action || action !== "run") {
+if (!action || (action !== "run" && action !== "build-image")) {
   console.log("Current configuration options:");
   console.log(JSON.stringify(config, null, 2));
-  console.log("\nTo run the script, pass 'run' as the first argument. For example:");
+  console.log("\nTo run the script, pass 'run' as the first argument or 'build-image' to produce a preloaded image. For example:");
+  console.log("  node runpod_lora_train.js build-image --config config.json");
   console.log("  node runpod_lora_train.js run --config config.json");
   process.exit(0);
+}
+
+if (action === "build-image") {
+  buildTrainingImage(config)
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error("❌ Failed to build training image:", error);
+      process.exit(1);
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -114,6 +166,21 @@ async function debugGraphQLRequest(client, query, variables, config) {
 // ---------------------------------------------------------------------
 // FUNCTION DEFINITIONS (All functions receive parameters)
 // ---------------------------------------------------------------------
+
+/**
+ * Extract a deterministic filename for the remote model download.
+ */
+function getModelFilename(modelPath) {
+  if (!modelPath) return "model.safetensors";
+  const cleaned = modelPath.replace(/\/$/, "");
+  const parts = cleaned.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "model.safetensors";
+}
+
+function runLocalCommand(command) {
+  console.log(`$ ${command}`);
+  execSync(command, { stdio: "inherit" });
+}
 
 /**
  * chooseGpuType(minMemory, minBidPriceLimit, maxBidPriceLimit, graphqlClient, config)
@@ -180,6 +247,143 @@ async function chooseGpuType(minMemory, minBidPriceLimit, maxBidPriceLimit, grap
     console.error("❌ Error querying GPU types:", error);
     process.exit(1);
   }
+}
+
+function generateEntrypointScript(config) {
+  const entrypointPath = path.join(process.cwd(), "docker", "entrypoint.sh");
+  if (!fs.existsSync(entrypointPath)) {
+    throw new Error("docker/entrypoint.sh is missing. Please ensure the docker folder is present.");
+  }
+  return fs.readFileSync(entrypointPath, "utf8");
+}
+
+function generateDockerfile(config) {
+  const datasetConfigName = path.basename(config.trainingConfigFile);
+  const sdConfigName = config.sdScriptsConfigFile
+    ? path.basename(config.sdScriptsConfigFile)
+    : datasetConfigName;
+  const baseModelName = getModelFilename(config.modelPath);
+  return `FROM ${config.ostrisBaseImage || config.baseImage}
+
+WORKDIR /workspace
+RUN apt-get update && apt-get install -y git awscli wget && rm -rf /var/lib/apt/lists/*
+
+# sd-scripts backend in addition to Ostris base
+RUN rm -rf /workspace/${config.sdScriptsDirName} && \
+    git clone ${config.sdScriptsRepo} /workspace/${config.sdScriptsDirName} && \
+    pip install -r /workspace/${config.sdScriptsDirName}/requirements.txt && \
+    pip install accelerate
+
+# Copy dataset and configs
+COPY dataset ${config.remoteDatasetPath}
+COPY training-config ${config.remoteDatasetPath}/training-config
+
+# Download base model into the image
+RUN mkdir -p ${config.remoteModelsPath} && \
+    wget -O ${config.remoteModelsPath}/${baseModelName} ${config.modelPath}
+
+COPY entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
+ENV TRAINING_BACKEND=${config.trainingBackend}
+ENV TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${datasetConfigName}
+ENV SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}
+ENV OUTPUT_DIR=${config.trainOutputDir}
+ENV MODEL_PATH=${config.remoteModelsPath}/${baseModelName}
+ENV TOOLKIT_PRESET=${config.toolkitPreset}
+ENV NETWORK_TYPE=z-image-turbo
+ENV KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}
+ENV S3_BUCKET=${config.s3Bucket}
+ENV S3_OUTPUT_PREFIX=${config.s3OutputPrefix}
+ENV AWS_DEFAULT_REGION=${config.s3Region}
+CMD ["/workspace/entrypoint.sh"]
+`;
+}
+
+function createS3Client(config) {
+  return new S3Client({
+    region: config.s3Region,
+    credentials:
+      config.awsAccessKeyId && config.awsSecretAccessKey
+        ? {
+            accessKeyId: config.awsAccessKeyId,
+            secretAccessKey: config.awsSecretAccessKey,
+          }
+        : undefined,
+  });
+}
+
+async function uploadFileToS3(filePath, bucket, key, config) {
+  if (!bucket || !key) {
+    console.log("ℹ️  Skipping S3 upload because bucket or key was not provided.");
+    return;
+  }
+  const client = createS3Client(config);
+  const body = fs.createReadStream(filePath);
+  const fileSize = fs.statSync(filePath).size;
+  console.log(`☁️  Uploading ${filePath} to s3://${bucket}/${key}...`);
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentLength: fileSize,
+    })
+  );
+  console.log("✅ Image tarball uploaded to S3.");
+}
+
+function buildBaseImages(config) {
+  console.log("🧱 Building Ostris base image...");
+  runLocalCommand(
+    `docker build -f docker/Dockerfile.ostris-base --build-arg BASE_IMAGE=${config.baseImage} -t ${config.ostrisBaseImage} .`
+  );
+  console.log("🧱 Building sd-scripts base image...");
+  runLocalCommand(
+    `docker build -f docker/Dockerfile.sd-scripts-base --build-arg BASE_IMAGE=${config.baseImage} -t ${config.sdScriptsBaseImage} .`
+  );
+}
+
+function prepareBuildContext(config) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "lora-build-"));
+  const datasetTarget = path.join(tempDir, "dataset");
+  const configTarget = path.join(tempDir, "training-config");
+  fs.ensureDirSync(datasetTarget);
+  fs.ensureDirSync(configTarget);
+
+  if (!fs.existsSync(config.localDatasetPath)) {
+    throw new Error(`Dataset path not found: ${config.localDatasetPath}`);
+  }
+  fs.copySync(config.localDatasetPath, datasetTarget);
+
+  if (!fs.existsSync(config.trainingConfigFile)) {
+    throw new Error(`Training config file not found: ${config.trainingConfigFile}`);
+  }
+  fs.copyFileSync(config.trainingConfigFile, path.join(configTarget, path.basename(config.trainingConfigFile)));
+  if (config.sdScriptsConfigFile && fs.existsSync(config.sdScriptsConfigFile)) {
+    fs.copyFileSync(config.sdScriptsConfigFile, path.join(configTarget, path.basename(config.sdScriptsConfigFile)));
+  }
+
+  fs.writeFileSync(path.join(tempDir, "entrypoint.sh"), generateEntrypointScript(config), { mode: 0o755 });
+  fs.writeFileSync(path.join(tempDir, "Dockerfile"), generateDockerfile(config));
+  return tempDir;
+}
+
+async function buildTrainingImage(config) {
+  console.log("📦 Building Docker image with datasets and dependencies included...");
+  buildBaseImages(config);
+  const contextDir = prepareBuildContext(config);
+  runLocalCommand(`docker build -t ${config.builtImageName} ${contextDir}`);
+  if (config.pushBuiltImage) {
+    console.log(`🚀 Pushing image ${config.builtImageName} to registry...`);
+    runLocalCommand(`docker push ${config.builtImageName}`);
+  }
+
+  const tarPath = path.join(os.tmpdir(), `lora-image-${Date.now()}.tar`);
+  runLocalCommand(`docker save -o ${tarPath} ${config.builtImageName}`);
+  const bucket = config.s3ImageBucket || config.s3Bucket;
+  await uploadFileToS3(tarPath, bucket, config.s3ImageKey, config);
+  fs.removeSync(tarPath);
+  console.log(`✅ Image ready and archived: ${config.builtImageName}`);
 }
 
 /**
@@ -432,47 +636,99 @@ async function executeCommand(ssh, command, config) {
 }
 
 /**
- * cloneSdScripts(ssh, config)
+ * cloneAiToolkit(ssh, config, toolkitPath)
  *
- * Clones the sd-scripts repository into the home directory.
+ * Clones the Ostris AI Toolkit repository into the workspace.
  */
-async function cloneSdScripts(ssh, config) {
-  console.log("📥 Cloning sd-scripts repository...");
-  const command = `git clone https://github.com/kohya-ss/sd-scripts.git ${config.volumeMountPath}/sd-scripts`;
+async function cloneAiToolkit(ssh, config, toolkitPath) {
+  console.log("📥 Cloning Ostris AI Toolkit repository...");
+  const command = `rm -rf ${toolkitPath} && git clone ${config.toolkitRepo} ${toolkitPath}`;
   await executeCommand(ssh, command, config);
 }
 
 /**
- * installPythonRequirements(ssh, config)
+ * installPythonRequirements(ssh, config, toolkitPath)
  *
- * Installs the Python requirements for the sd-scripts repository.
+ * Installs the Python requirements for the Ostris AI Toolkit repository.
  */
-async function installPythonRequirements(ssh, config) {
-  console.log("📦 Installing Python requirements...");
-  const command = `cd ${config.volumeMountPath}/sd-scripts &&
-    pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118 &&
-    pip install --upgrade -r requirements.txt && 
-    pip install xformers==0.0.23.post1 --index-url https://download.pytorch.org/whl/cu118
+async function installPythonRequirements(ssh, config, toolkitPath) {
+  console.log("📦 Installing Python requirements for Ostris AI Toolkit...");
+  const command = `cd ${toolkitPath} &&
+    pip install --upgrade pip &&
+    pip install --upgrade -r requirements.txt &&
+    pip install -e .
 `;
-
-// pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121 &&
-// pip install --upgrade -r requirements.txt && 
-// pip install xformers==0.0.22.post4 --index-url https://download.pytorch.org/whl/cu121
   await executeCommand(ssh, command, config);
 }
 
 /**
- * launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteModelsPath, config)
+ * launchTraining(ssh, toolkitPath, datasetConfigPath, trainOutputDir, baseModelPath, config)
  *
- * Launches the LoRA training process using the sd-scripts repository.
+ * Launches the LoRA training process using the Ostris AI Toolkit repository.
  */
-async function launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteModelsPath, config) {
-  console.log("🚀 Launching LoRA training...");
-  const trainingCommand = `
-    cd ${config.volumeMountPath}/sd-scripts && 
-    accelerate launch sdxl_train_network.py --config_file=../dataset/config.toml
-  `;
-  await executeCommand(ssh, trainingCommand, config);
+async function launchTraining(
+  ssh,
+  config
+) {
+  console.log("🚀 Launching training from the S3-archived container image...");
+  const bucket = config.s3ImageBucket || config.s3Bucket;
+  if (!bucket || !config.s3ImageKey) {
+    throw new Error("S3 image bucket and key are required to retrieve the training image inside the pod.");
+  }
+
+  const installer = [
+    "apt-get update",
+    "apt-get install -y awscli docker.io",
+    "service docker start || true"
+  ].join(" && ");
+  await executeCommand(ssh, installer, config);
+
+  const awsEnvExports = [
+    config.awsAccessKeyId ? `export AWS_ACCESS_KEY_ID='${config.awsAccessKeyId}'` : null,
+    config.awsSecretAccessKey ? `export AWS_SECRET_ACCESS_KEY='${config.awsSecretAccessKey}'` : null,
+    `export AWS_DEFAULT_REGION='${config.s3Region}'`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
+
+  const downloadCommand = [awsEnvExports, `aws s3 cp s3://${bucket}/${config.s3ImageKey} /workspace/training-image.tar --region ${config.s3Region}`]
+    .filter(Boolean)
+    .join(" && ");
+  await executeCommand(ssh, downloadCommand, config);
+
+  const sdConfigName = config.sdScriptsConfigFile
+    ? path.basename(config.sdScriptsConfigFile)
+    : path.basename(config.trainingConfigFile);
+  const runtimeEnv = [
+    `-e TRAINING_BACKEND=${config.trainingBackend}`,
+    `-e TRAINING_CONFIG_PATH=${config.remoteDatasetPath}/training-config/${path.basename(config.trainingConfigFile)}`,
+    `-e SD_SCRIPTS_CONFIG=${config.remoteDatasetPath}/training-config/${sdConfigName}`,
+    `-e OUTPUT_DIR=${config.trainOutputDir}`,
+    `-e MODEL_PATH=${config.remoteModelsPath}/${getModelFilename(config.modelPath)}`,
+    `-e TOOLKIT_PRESET=${config.toolkitPreset}`,
+    `-e NETWORK_TYPE=z-image-turbo`,
+    `-e KEEP_ALIVE=${config.keepContainerAlive ? 1 : 0}`,
+    config.s3Bucket ? `-e S3_BUCKET=${config.s3Bucket}` : null,
+    `-e S3_OUTPUT_PREFIX=${config.s3OutputPrefix}`,
+    `-e AWS_DEFAULT_REGION=${config.s3Region}`,
+    config.awsAccessKeyId ? `-e AWS_ACCESS_KEY_ID=${config.awsAccessKeyId}` : null,
+    config.awsSecretAccessKey ? `-e AWS_SECRET_ACCESS_KEY=${config.awsSecretAccessKey}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const volumeFlags = [`-v ${config.trainOutputDir}:${config.trainOutputDir}`];
+
+  const dockerCommands = [
+    awsEnvExports,
+    `mkdir -p ${config.trainOutputDir}`,
+    "docker load -i /workspace/training-image.tar",
+    `docker run --rm --gpus all --ipc=host --network=host ${volumeFlags.join(" ")} ${runtimeEnv} ${config.builtImageName}`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
+
+  await executeCommand(ssh, dockerCommands, config);
 }
 
 /**
@@ -480,13 +736,12 @@ async function launchTraining(ssh, remoteDatasetPath, trainOutputDir, remoteMode
  *
  * Downloads the base model from Hugging Face into the remote models directory.
  */
-async function downloadModel(ssh, config) {
+async function downloadModel(ssh, config, targetModelPath) {
   console.log("📥 Downloading model from Hugging Face...");
   const command = `
     mkdir -p ${config.trainOutputDir} &&
     mkdir -p ${config.remoteModelsPath} &&
-    cd ${config.remoteModelsPath} &&
-    wget -q ${config.modelPath}
+    wget -q -O ${targetModelPath} ${config.modelPath}
   `;
   await executeCommand(ssh, command, config);
 }
@@ -553,22 +808,12 @@ async function main(config) {
   // 3. Establish an SSH connection (using username "root").
   const sshConnection = await connectSSH(instance, "root");
 
-  // 4. Upload the dataset.
-  await uploadDataset(config.localDatasetPath, instance, "root", config.remoteDatasetPath, config);
+  console.log("📦 Using S3-archived prebuilt image; skipping dataset/model uploads and dependency installs.");
 
-  // 5. Download the base model from Hugging Face.
-  await downloadModel(sshConnection, config);
+  // Launch the training directly from the image contents.
+  await launchTraining(sshConnection, config);
 
-  // 6. Clone the sd-scripts repository.
-  await cloneSdScripts(sshConnection, config);
-
-  // 7. Install Python requirements.
-  await installPythonRequirements(sshConnection, config);
-
-  // 8. Launch the LoRA training.
-  await launchTraining(sshConnection, config.remoteDatasetPath, config.trainOutputDir, config.remoteModelsPath, config);
-
-  // 9. Download the training output.
+  // Download the training output.
   await downloadOutput(instance, "root", config.trainOutputDir, config.localOutputDir, config);
 
   // 10. Stop the pod.
@@ -580,4 +825,6 @@ async function main(config) {
   process.exit(0);
 }
 
-main(config);
+if (action !== "build-image") {
+  main(config);
+}
